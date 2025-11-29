@@ -128,15 +128,13 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
     const sections = (plan as any).sections || [];
     console.log(`[Step 1] Generated ${sections.length} sections.`);
 
-    // Step 2: Research & Write Each Section SEQUENTIALLY
-    // We use a loop instead of Promise.all to avoid Cloudflare's "Too many subrequests" limit per step.
-    const sectionResults = [];
-    
-    for (const section of sections) {
-      // Generate a safe step name (remove special chars)
-      const stepName = `research-${section.title.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`;
+    // Step 2: Research & Write All Sections (Combined Step)
+    // We process all sections in ONE workflow step but use Promise.all for parallelism.
+    // Since we have ~5 sections and ~3 calls each, total subrequests ~15-20 (< 50 limit).
+    const sectionResults = await step.do("research-all-sections", async () => {
+      console.log(`[Step 2] Starting research for ${sections.length} sections...`);
       
-      const result = await step.do(stepName, async () => {
+      const results = await Promise.all(sections.map(async (section: Section) => {
           console.log(`[Step 2] Processing section: ${section.title}`);
 
           // 2a. Generate Search Queries
@@ -148,7 +146,10 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
 
           // 2b. Fetch Sources (Wikipedia + ArXiv)
           const sources: SearchResult[] = [];
-          for (const q of queries) {
+          // Limit queries to 2 per section to be safe
+          const limitedQueries = queries.slice(0, 2);
+          
+          for (const q of limitedQueries) {
             // Wikipedia Search
             try {
               const searchRes = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json`, {
@@ -157,7 +158,6 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
               const searchData = await searchRes.json() as any;
               if (searchData.query?.search?.length > 0) {
                  const title = searchData.query.search[0].title;
-                 // Get Summary
                  const summaryRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`, {
                     headers: { "User-Agent": "CloudflareResearchAssistant/1.0" }
                  });
@@ -165,17 +165,15 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
                     const summaryData = await summaryRes.json() as any;
                     sources.push({ title: summaryData.title, extract: summaryData.extract, url: summaryData.content_urls?.desktop?.page || "" });
                  } else {
-                    // Fallback to snippet
                     sources.push({ title: title, extract: searchData.query.search[0].snippet.replace(/<[^>]*>?/gm, ''), url: `https://en.wikipedia.org/wiki/${encodeURIComponent(title)}` });
                  }
               }
             } catch (e) { console.error("Wiki Error", e); }
             
-            // ArXiv Search
+            // ArXiv Search (Only 1 call)
             try {
                const arxivRes = await fetch(`http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(q)}&start=0&max_results=1`);
                const arxivText = await arxivRes.text();
-               // Simple XML parse regex
                const entryMatch = arxivText.match(/<entry>([\s\S]*?)<\/entry>/);
                if (entryMatch) {
                   const titleMatch = entryMatch[1].match(/<title>([\s\S]*?)<\/title>/);
@@ -206,10 +204,10 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
             content: (writeResponse as any).response,
             sources: sources.map(s => ({ title: s.title, url: s.url }))
           };
-      });
+      }));
       
-      sectionResults.push(result);
-    }
+      return results;
+    });
 
     // Step 3: Compile Report
     await step.do("compile-report", async () => {
