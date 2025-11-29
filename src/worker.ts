@@ -5,7 +5,7 @@ import {
 } from "cloudflare:workers";
 
 export interface Env {
-  RESEARCH_WORKFLOW: Workflow;
+  RESEARCH_WORKFLOW_V2: Workflow;
   RESEARCH_CACHE: KVNamespace;
   AI: Ai;
   VECTORIZE: VectorizeIndex;
@@ -84,10 +84,8 @@ Based *only* on the provided research context, write a comprehensive markdown se
 // --- Helper Functions ---
 function extractJson(text: string): any {
   try {
-    // 1. Try parsing directly
     return JSON.parse(text);
   } catch (e) {
-    // 2. Try extracting from markdown code blocks
     const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/) || text.match(/```\n([\s\S]*?)\n```/);
     if (jsonMatch && jsonMatch[1]) {
       try {
@@ -96,7 +94,6 @@ function extractJson(text: string): any {
         // continue
       }
     }
-    // 3. Try finding the first '{' and last '}'
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start !== -1 && end !== -1) {
@@ -111,7 +108,6 @@ function extractJson(text: string): any {
 }
 
 // --- Workflow ---
-// RENAMED to V2 to clear old queues
 export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string; sessionId: string }> {
   async run(event: WorkflowEvent<{ query: string; sessionId: string }>, step: WorkflowStep) {
     const { query, sessionId } = event.payload;
@@ -129,12 +125,16 @@ export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string;
     const sections = (plan as any).sections || [];
     console.log(`[Step 1] Generated ${sections.length} sections.`);
 
-    // Step 2: Research & Write All Sections (Combined Step)
-    const sectionResults = await step.do("research-all-sections", async () => {
-      console.log(`[Step 2] Starting research for ${sections.length} sections...`);
+    // Step 2: Research & Write Each Section (INDIVIDUAL STEPS)
+    // Each section gets its own step.do() to reset subrequest limits and prevent retry accumulation
+    const sectionResults = [];
+    
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i];
+      const stepName = `research-section-${i + 1}`;
       
-      const results = await Promise.all(sections.map(async (section: Section) => {
-          console.log(`[Step 2] Processing section: ${section.title}`);
+      const result = await step.do(stepName, async () => {
+          console.log(`[Step 2] Processing section ${i + 1}/${sections.length}: ${section.title}`);
 
           // 2a. Generate Search Queries
           const queriesResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
@@ -143,9 +143,9 @@ export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string;
           const queriesData = extractJson((queriesResponse as any).response);
           const queries = (queriesData as any).queries || [];
 
-          // 2b. Fetch Sources (Wikipedia + ArXiv)
+          // 2b. Fetch Sources (Wikipedia only - ArXiv disabled to reduce subrequests)
           const sources: SearchResult[] = [];
-          const limitedQueries = queries.slice(0, 2);
+          const limitedQueries = queries.slice(0, 1); // Only 1 query per section
           
           for (const q of limitedQueries) {
             try {
@@ -166,24 +166,6 @@ export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string;
                  }
               }
             } catch (e) { console.error("Wiki Error", e); }
-            
-            try {
-               const arxivRes = await fetch(`http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(q)}&start=0&max_results=1`);
-               const arxivText = await arxivRes.text();
-               const entryMatch = arxivText.match(/<entry>([\s\S]*?)<\/entry>/);
-               if (entryMatch) {
-                  const titleMatch = entryMatch[1].match(/<title>([\s\S]*?)<\/title>/);
-                  const summaryMatch = entryMatch[1].match(/<summary>([\s\S]*?)<\/summary>/);
-                  const idMatch = entryMatch[1].match(/<id>([\s\S]*?)<\/id>/);
-                  if (titleMatch && summaryMatch && idMatch) {
-                     sources.push({
-                        title: titleMatch[1].trim(),
-                        extract: summaryMatch[1].trim(),
-                        url: idMatch[1].trim()
-                     });
-                  }
-               }
-            } catch (e) { console.error("ArXiv Error", e); }
           }
 
           // 2c. Write Section
@@ -199,10 +181,10 @@ export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string;
             content: (writeResponse as any).response,
             sources: sources.map(s => ({ title: s.title, url: s.url }))
           };
-      }));
+      });
       
-      return results;
-    });
+      sectionResults.push(result);
+    }
 
     // Step 3: Compile Report
     await step.do("compile-report", async () => {
@@ -249,10 +231,8 @@ export default {
         const { text, filename } = await request.json() as UploadRequest;
         const documentId = crypto.randomUUID();
 
-        // 1. Chunk text (simple chunking for now)
-        const chunks = text.match(/[\s\S]{1,1500}/g) || []; // ~500 words chunks
+        const chunks = text.match(/[\s\S]{1,1500}/g) || [];
 
-        // 2. Generate embeddings for chunks
         const vectors = await Promise.all(chunks.map(async (chunk, i) => {
           const embedding = await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: [chunk] }) as any;
           return {
@@ -266,7 +246,6 @@ export default {
           };
         }));
 
-        // 3. Store in Vectorize
         await env.VECTORIZE.upsert(vectors);
 
         return Response.json({ documentId, filename, chunks: chunks.length }, { headers: corsHeaders });
@@ -281,10 +260,8 @@ export default {
         const { query, documentId } = await request.json() as ChatRequest;
         console.log(`[PDF Chat] Query: "${query}", DocumentID: ${documentId}`);
 
-        // 1. Embed Query
         const queryEmbedding = await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: [query] }) as any;
 
-        // 2. Search Vector Index
         const searchResults = await env.VECTORIZE.query(queryEmbedding.data[0], {
           topK: 10,
           returnMetadata: true
@@ -293,7 +270,6 @@ export default {
         const relevantMatches = searchResults.matches.filter(m => m.metadata?.documentId === documentId);
         console.log(`[PDF Chat] Found ${relevantMatches.length} relevant matches (from top 10).`);
 
-        // 3. Prepare Context
         const context = relevantMatches
           .map(m => m.metadata?.text)
           .join("\n---\n");
@@ -303,7 +279,6 @@ export default {
            return Response.json({ answer: "I couldn't find any specific information in the document about that. Could you rephrase or ask something else?" }, { headers: corsHeaders });
         }
 
-        // 4. Generate Answer
         const prompt = `You are an intelligent research assistant helping a user analyze a PDF document.
 
 Document Context:
@@ -346,13 +321,27 @@ Answer:`;
       const body = await request.json() as { query: string };
       const sessionId = crypto.randomUUID();
       
+      console.log(`[API] Creating workflow for query: "${body.query}", sessionId: ${sessionId}`);
+      
       try {
-        const workflow = env.RESEARCH_WORKFLOW as any;
+        const workflow = env.RESEARCH_WORKFLOW_V2 as any;
+        
+        // Create workflow
         await workflow.create({
           id: sessionId,
           params: { query: body.query, sessionId }
         });
+        console.log(`[API] Workflow created successfully: ${sessionId}`);
+        
+        // Verify workflow exists (optional check)
+        try {
+          const workflowInstance = await workflow.get(sessionId);
+          console.log(`[API] Workflow instance verified:`, workflowInstance ? "exists" : "not found");
+        } catch (e) {
+          console.log(`[API] Workflow get check:`, e);
+        }
       } catch (error) {
+        console.error(`[API] Workflow creation failed:`, error);
         return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: corsHeaders });
       }
 

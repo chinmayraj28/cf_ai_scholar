@@ -3,8 +3,8 @@ main = "src/worker.ts"
 compatibility_date = "2024-04-03"
 
 [[workflows]]
-name = "RESEARCH_WORKFLOW"
-binding = "RESEARCH_WORKFLOW"
+name = "RESEARCH_WORKFLOW_V2"
+binding = "RESEARCH_WORKFLOW_V2"
 class_name = "ResearchWorkflowV2"
 
 [[kv_namespaces]]
