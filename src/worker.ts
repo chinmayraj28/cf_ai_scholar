@@ -22,6 +22,12 @@ type Section = {
   focus: string;
 };
 
+type SectionResult = {
+  title: string;
+  content: string;
+  sources: Array<{ title: string; url: string }>;
+};
+
 interface UploadRequest {
   text: string;
   filename?: string;
@@ -83,28 +89,63 @@ Based *only* on the provided research context, write a comprehensive markdown se
 
 // --- Helper Functions ---
 function extractJson(text: string): any {
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/) || text.match(/```\n([\s\S]*?)\n```/);
-    if (jsonMatch && jsonMatch[1]) {
-      try {
-        return JSON.parse(jsonMatch[1]);
-      } catch (e2) {
-        // continue
-      }
-    }
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start !== -1 && end !== -1) {
-      try {
-        return JSON.parse(text.substring(start, end + 1));
-      } catch (e3) {
-        throw new Error("Failed to extract JSON: " + text.substring(0, 100) + "...");
-      }
-    }
-    throw new Error("No JSON found in response");
+  if (!text || typeof text !== 'string') {
+    throw new Error("Invalid input: not a string");
   }
+  
+  // Try direct parse first
+  try {
+    return JSON.parse(text.trim());
+  } catch (e) {
+    // Continue to other methods
+  }
+  
+  // Try extracting from markdown code blocks
+  const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/) || 
+                    text.match(/```\n([\s\S]*?)\n```/) ||
+                    text.match(/```([\s\S]*?)```/);
+  if (jsonMatch && jsonMatch[1]) {
+    try {
+      return JSON.parse(jsonMatch[1].trim());
+    } catch (e2) {
+      // Continue
+    }
+  }
+  
+  // Try finding JSON object boundaries
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      const jsonStr = text.substring(start, end + 1);
+      return JSON.parse(jsonStr);
+    } catch (e3) {
+      // Try to fix common issues
+      try {
+        // Remove trailing commas
+        const fixed = text.substring(start, end + 1).replace(/,(\s*[}\]])/g, '$1');
+        return JSON.parse(fixed);
+      } catch (e4) {
+        // Last resort: try to extract just the array/object content
+        const arrayMatch = text.match(/\[([\s\S]*?)\]/);
+        if (arrayMatch) {
+          try {
+            return { queries: JSON.parse(`[${arrayMatch[1]}]`) };
+          } catch (e5) {
+            // Give up
+          }
+        }
+      }
+    }
+  }
+  
+  // Try to extract array of strings (for queries)
+  const quotedStrings = text.match(/"([^"]+)"/g);
+  if (quotedStrings && quotedStrings.length > 0) {
+    return { queries: quotedStrings.map(s => s.replace(/"/g, '')) };
+  }
+  
+  throw new Error("No JSON found in response: " + text.substring(0, 200));
 }
 
 // --- Workflow ---
@@ -112,75 +153,202 @@ export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string;
   async run(event: WorkflowEvent<{ query: string; sessionId: string }>, step: WorkflowStep) {
     const { query, sessionId } = event.payload;
 
-    // Step 1: Plan Research
-    const plan = await step.do("plan-research", async () => {
-      console.log(`[Step 1] Planning research for: ${query}`);
-      const response = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
-        messages: [{ role: "user", content: plannerPrompt(query) }],
+    try {
+      // Step 1: Plan Research
+      const plan = await step.do("plan-research", async () => {
+        try {
+          console.log(`[Step 1] Planning research for: ${query}`);
+          const response = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
+            messages: [{ role: "user", content: plannerPrompt(query) }],
+            max_tokens: 600, // Increased slightly for better quality
+          });
+          console.log("[Step 1] Raw response:", (response as any).response);
+          return extractJson((response as any).response);
+        } catch (e) {
+          console.error("[Step 1] Error in planning:", e);
+          throw new Error(`Planning failed: ${String(e)}`);
+        }
       });
-      console.log("[Step 1] Raw response:", (response as any).response);
-      return extractJson((response as any).response);
-    });
 
-    const sections = (plan as any).sections || [];
+    let sections = (plan as any).sections || [];
     console.log(`[Step 1] Generated ${sections.length} sections.`);
+    console.log(`[Step 1] Section titles:`, sections.map((s: any) => s.title).join(", "));
+    
+    // Validate sections are relevant to the query
+    if (sections.length === 0) {
+      throw new Error("Planner generated no sections");
+    }
+    
+    // Check if sections are relevant to the query - STRICT VALIDATION
+    const queryLower = query.toLowerCase();
+    
+    // Better comparison detection: "X with or without Y" is a single topic, not a comparison
+    const isTrueComparison = (queryLower.match(/\s+(vs|versus)\s+/) || 
+                              (queryLower.includes(' or ') && !queryLower.includes(' with or without ') && !queryLower.includes(' with or ')));
+    
+    // Extract main topic(s) from query
+    let mainTopics: string[] = [];
+    if (isTrueComparison) {
+      // Split on vs/versus/or (but not "with or without")
+      const parts = query.split(/\s+(vs|versus|or)\s+/i).map(p => p.trim().replace(/\?/g, '').toLowerCase());
+      mainTopics = parts.filter(p => p.length > 0);
+    } else {
+      // Single topic - extract main words (for "cereal with or without milk", extract "cereal" and "milk")
+      const stopWords = ['what', 'is', 'are', 'the', 'a', 'an', 'of', 'for', 'about', 'how', 'why', 'when', 'where', 'with', 'without', 'or'];
+      const words = queryLower.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
+      mainTopics = words.slice(0, 3); // Take first 3 meaningful words
+    }
+    
+    // Check if sections actually relate to the main topics
+    let relevantCount = 0;
+    for (const section of sections) {
+      const titleLower = (section.title || '').toLowerCase();
+      const focusLower = (section.focus || '').toLowerCase();
+      const combined = titleLower + ' ' + focusLower;
+      
+      // Check if section mentions at least one main topic
+      const mentionsMainTopic = mainTopics.some(topic => {
+        const topicWords = topic.split(/\s+/);
+        return topicWords.some(word => combined.includes(word) && word.length > 2);
+      });
+      
+      if (mentionsMainTopic) relevantCount++;
+    }
+    
+    // If less than 75% of sections are relevant, use fallback (stricter threshold)
+    if (relevantCount < sections.length * 0.75 || relevantCount === 0) {
+      console.warn(`[Step 1] Only ${relevantCount}/${sections.length} sections seem relevant to "${query}". Using fallback.`);
+      
+      if (isTrueComparison) {
+        const parts = query.split(/\s+(vs|versus|or)\s+/i).map(p => p.trim().replace(/\?/g, ''));
+        sections = [
+          { title: `Introduction: ${parts[0]} vs ${parts[1]}`, focus: `Overview comparing ${parts[0]} and ${parts[1]}` },
+          { title: `About ${parts[0]}`, focus: `Characteristics, features, and benefits of ${parts[0]}` },
+          { title: `About ${parts[1]}`, focus: `Characteristics, features, and benefits of ${parts[1]}` },
+          { title: `Comparison and Conclusion`, focus: `Which is better for different situations` }
+        ];
+      } else if (queryLower.includes(' with or without ')) {
+        // Handle "X with or without Y" - treat as single topic with two options
+        const topic = query.replace(/\s+with or without\s+.*\?/i, '').trim();
+        const option = query.match(/with or without\s+([^?]+)/i)?.[1]?.trim() || '';
+        sections = [
+          { title: `Introduction: ${topic}`, focus: `Overview of ${topic} and the question of using it with or without ${option}` },
+          { title: `${topic} with ${option}`, focus: `Benefits, characteristics, and uses of ${topic} with ${option}` },
+          { title: `${topic} without ${option}`, focus: `Benefits, characteristics, and uses of ${topic} without ${option}` },
+          { title: `Comparison and Conclusion`, focus: `Which option is better for different situations` }
+        ];
+      } else {
+        const topic = query.replace(/\?/g, '').trim();
+        sections = [
+          { title: `Introduction to ${topic}`, focus: `Overview and key information about ${topic}` },
+          { title: `Key Aspects of ${topic}`, focus: `Important details and characteristics` },
+          { title: `Applications and Examples`, focus: `Real-world examples and use cases` },
+          { title: `Conclusion`, focus: `Summary and final thoughts` }
+        ];
+      }
+      console.log(`[Step 1] Using fallback sections:`, sections.map((s: any) => s.title).join(", "));
+    }
 
     // Step 2: Research & Write Each Section (INDIVIDUAL STEPS)
     // Each section gets its own step.do() to reset subrequest limits and prevent retry accumulation
-    const sectionResults = [];
+    const sectionResults: SectionResult[] = [];
     
     for (let i = 0; i < sections.length; i++) {
       const section = sections[i];
       const stepName = `research-section-${i + 1}`;
       
       const result = await step.do(stepName, async () => {
-          console.log(`[Step 2] Processing section ${i + 1}/${sections.length}: ${section.title}`);
+          try {
+            console.log(`[Step 2] Processing section ${i + 1}/${sections.length}: ${section.title}`);
 
-          // 2a. Generate Search Queries
-          const queriesResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
-            messages: [{ role: "user", content: searchQueriesPrompt(section.title, section.focus) }],
-          });
-          const queriesData = extractJson((queriesResponse as any).response);
-          const queries = (queriesData as any).queries || [];
+            // 2a. Generate Search Query (simplified: use section title + focus for better results)
+            // Skip AI query generation to save time - use section title directly
+            const searchQuery = `${section.title} ${section.focus}`.substring(0, 100); // Limit length
+            console.log(`[Step 2] Using search query for section ${i + 1}: "${searchQuery}"`);
 
-          // 2b. Fetch Sources (Wikipedia only - ArXiv disabled to reduce subrequests)
-          const sources: SearchResult[] = [];
-          const limitedQueries = queries.slice(0, 1); // Only 1 query per section
-          
-          for (const q of limitedQueries) {
-            try {
-              const searchRes = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json`, {
-                headers: { "User-Agent": "CloudflareResearchAssistant/1.0" }
-              });
-              const searchData = await searchRes.json() as any;
-              if (searchData.query?.search?.length > 0) {
-                 const title = searchData.query.search[0].title;
-                 const summaryRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`, {
-                    headers: { "User-Agent": "CloudflareResearchAssistant/1.0" }
-                 });
-                 if (summaryRes.ok) {
-                    const summaryData = await summaryRes.json() as any;
-                    sources.push({ title: summaryData.title, extract: summaryData.extract, url: summaryData.content_urls?.desktop?.page || "" });
-                 } else {
-                    sources.push({ title: title, extract: searchData.query.search[0].snippet.replace(/<[^>]*>?/gm, ''), url: `https://en.wikipedia.org/wiki/${encodeURIComponent(title)}` });
-                 }
+            // 2b. Fetch Sources (Wikipedia only - ArXiv disabled to reduce subrequests)
+            const sources: SearchResult[] = [];
+            const queries = [searchQuery]; // Use the combined title+focus as query
+            
+            for (const q of queries) {
+              try {
+                const searchRes = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json`, {
+                  headers: { "User-Agent": "CloudflareResearchAssistant/1.0" }
+                });
+                if (!searchRes.ok) {
+                  console.error(`[Step 2] Wikipedia search failed: ${searchRes.status}`);
+                  continue;
+                }
+                const searchData = await searchRes.json() as any;
+                if (searchData.query?.search?.length > 0) {
+                   const title = searchData.query.search[0].title;
+                   const summaryRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`, {
+                      headers: { "User-Agent": "CloudflareResearchAssistant/1.0" }
+                   });
+                   if (summaryRes.ok) {
+                      const summaryData = await summaryRes.json() as any;
+                      sources.push({ title: summaryData.title, extract: summaryData.extract, url: summaryData.content_urls?.desktop?.page || "" });
+                   } else {
+                      sources.push({ title: title, extract: searchData.query.search[0].snippet.replace(/<[^>]*>?/gm, ''), url: `https://en.wikipedia.org/wiki/${encodeURIComponent(title)}` });
+                   }
+                }
+              } catch (e) { 
+                console.error(`[Step 2] Wiki Error for query "${q}":`, e); 
               }
-            } catch (e) { console.error("Wiki Error", e); }
+            }
+
+            console.log(`[Step 2] Found ${sources.length} sources for section ${i + 1}`);
+
+            // 2c. Write Section
+            const context = sources.map(s => `Title: ${s.title}\nSummary: ${s.extract || 'No summary available'}`).join("\n\n");
+            
+            // If no sources, still generate content based on section title and focus
+            const contextToUse = context.trim().length > 0 
+              ? context 
+              : `Section Focus: ${section.focus || section.title}\n\nNote: No external sources were found. Please write about the section title using general knowledge.`;
+
+            let sectionContent: string;
+            try {
+              const writeResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
+                messages: [{ role: "user", content: writerPrompt(section.title, contextToUse) }],
+                max_tokens: 800, // Limit tokens for faster response (300-500 words ≈ 400-700 tokens)
+              });
+              sectionContent = (writeResponse as any).response || `## ${section.title}\n\nContent generation failed.`;
+              console.log(`[Step 2] Generated content for section ${i + 1} (${sectionContent.length} chars)`);
+              
+              // Validate that content is on-topic (basic check)
+              const titleWords = section.title.toLowerCase().split(/\s+/).filter((w: string) => w.length > 3);
+              const contentLower = sectionContent.toLowerCase();
+              const hasTitleWords = titleWords.some((word: string) => contentLower.includes(word));
+              
+              if (!hasTitleWords && titleWords.length > 0) {
+                console.warn(`[Step 2] Generated content may be off-topic for section "${section.title}"`);
+                // Regenerate with stronger prompt
+                const strongerPrompt = writerPrompt(section.title, contextToUse) + `\n\nREMINDER: You MUST write about "${section.title}". Do not write about unrelated topics.`;
+                const retryResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
+                  messages: [{ role: "user", content: strongerPrompt }],
+                  max_tokens: 800,
+                });
+                sectionContent = (retryResponse as any).response || sectionContent;
+              }
+            } catch (e) {
+              console.error(`[Step 2] Error writing section ${i + 1}:`, e);
+              sectionContent = `## ${section.title}\n\nError generating content: ${String(e)}`;
+            }
+            
+            return {
+              title: section.title,
+              content: sectionContent,
+              sources: sources.map(s => ({ title: s.title, url: s.url }))
+            };
+          } catch (e) {
+            console.error(`[Step 2] Fatal error in section ${i + 1} (${section.title}):`, e);
+            return {
+              title: section.title,
+              content: `## ${section.title}\n\nAn error occurred while processing this section: ${String(e)}`,
+              sources: []
+            };
           }
-
-          // 2c. Write Section
-          const context = sources.map(s => `Title: ${s.title}\nSummary: ${s.extract}`).join("\n\n");
-          if (!context) return { title: section.title, content: "No sources found for this section.", sources: [] };
-
-          const writeResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
-            messages: [{ role: "user", content: writerPrompt(section.title, context) }],
-          });
-          
-          return {
-            title: section.title,
-            content: (writeResponse as any).response,
-            sources: sources.map(s => ({ title: s.title, url: s.url }))
-          };
       });
       
       sectionResults.push(result);
@@ -188,26 +356,56 @@ export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string;
 
     // Step 3: Compile Report
     await step.do("compile-report", async () => {
-      console.log("[Step 3] Compiling final report");
-      
-      let fullContent = `# ${query}\n\n`;
-      const allSources: {title: string, url: string}[] = [];
-      
-      for (const section of sectionResults) {
-        fullContent += section.content + "\n\n";
-        allSources.push(...(section.sources || []));
+      try {
+        console.log("[Step 3] Compiling final report");
+        
+        let fullContent = `# ${query}\n\n`;
+        const allSources: {title: string, url: string}[] = [];
+        
+        for (const section of sectionResults) {
+          if (section && section.content) {
+            fullContent += section.content + "\n\n";
+            if (section.sources && Array.isArray(section.sources)) {
+              allSources.push(...section.sources);
+            }
+          }
+        }
+
+        const uniqueSources = Array.from(new Map(allSources.map(s => [s.url, s])).values());
+
+        const result = {
+          query,
+          answer: fullContent,
+          sources: uniqueSources
+        };
+
+        await this.env.RESEARCH_CACHE.put(sessionId, JSON.stringify(result));
+        console.log("[Step 3] Report compiled and saved to KV");
+      } catch (e) {
+        console.error("[Step 3] Error compiling report:", e);
+        // Write error result to KV so frontend knows it failed
+        await this.env.RESEARCH_CACHE.put(sessionId, JSON.stringify({
+          query,
+          answer: `# ${query}\n\nError compiling report: ${String(e)}`,
+          sources: []
+        }));
+        throw e; // Re-throw to mark workflow as failed
       }
-
-      const uniqueSources = Array.from(new Map(allSources.map(s => [s.url, s])).values());
-
-      const result = {
-        query,
-        answer: fullContent,
-        sources: uniqueSources
-      };
-
-      await this.env.RESEARCH_CACHE.put(sessionId, JSON.stringify(result));
     });
+    } catch (e) {
+      // Catch any unhandled errors in the workflow
+      console.error("[Workflow] Fatal error:", e);
+      try {
+        await this.env.RESEARCH_CACHE.put(sessionId, JSON.stringify({
+          query,
+          answer: `# ${query}\n\nWorkflow failed with error: ${String(e)}`,
+          sources: []
+        }));
+      } catch (kvError) {
+        console.error("[Workflow] Failed to write error to KV:", kvError);
+      }
+      throw e; // Re-throw to mark workflow as failed
+    }
   }
 }
 
