@@ -111,7 +111,8 @@ function extractJson(text: string): any {
 }
 
 // --- Workflow ---
-export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; sessionId: string }> {
+// RENAMED to V2 to clear old queues
+export class ResearchWorkflowV2 extends WorkflowEntrypoint<Env, { query: string; sessionId: string }> {
   async run(event: WorkflowEvent<{ query: string; sessionId: string }>, step: WorkflowStep) {
     const { query, sessionId } = event.payload;
 
@@ -129,8 +130,6 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
     console.log(`[Step 1] Generated ${sections.length} sections.`);
 
     // Step 2: Research & Write All Sections (Combined Step)
-    // We process all sections in ONE workflow step but use Promise.all for parallelism.
-    // Since we have ~5 sections and ~3 calls each, total subrequests ~15-20 (< 50 limit).
     const sectionResults = await step.do("research-all-sections", async () => {
       console.log(`[Step 2] Starting research for ${sections.length} sections...`);
       
@@ -146,11 +145,9 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
 
           // 2b. Fetch Sources (Wikipedia + ArXiv)
           const sources: SearchResult[] = [];
-          // Limit queries to 2 per section to be safe
           const limitedQueries = queries.slice(0, 2);
           
           for (const q of limitedQueries) {
-            // Wikipedia Search
             try {
               const searchRes = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json`, {
                 headers: { "User-Agent": "CloudflareResearchAssistant/1.0" }
@@ -170,7 +167,6 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
               }
             } catch (e) { console.error("Wiki Error", e); }
             
-            // ArXiv Search (Only 1 call)
             try {
                const arxivRes = await fetch(`http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(q)}&start=0&max_results=1`);
                const arxivText = await arxivRes.text();
@@ -192,7 +188,6 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
 
           // 2c. Write Section
           const context = sources.map(s => `Title: ${s.title}\nSummary: ${s.extract}`).join("\n\n");
-          
           if (!context) return { title: section.title, content: "No sources found for this section.", sources: [] };
 
           const writeResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
@@ -221,7 +216,6 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
         allSources.push(...(section.sources || []));
       }
 
-      // Deduplicate sources
       const uniqueSources = Array.from(new Map(allSources.map(s => [s.url, s])).values());
 
       const result = {
@@ -291,13 +285,11 @@ export default {
         const queryEmbedding = await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: [query] }) as any;
 
         // 2. Search Vector Index
-        // Increased topK to 10 to get more context for summaries/broad questions
         const searchResults = await env.VECTORIZE.query(queryEmbedding.data[0], {
           topK: 10,
           returnMetadata: true
         });
         
-        // Filter manually to ensure strict document isolation
         const relevantMatches = searchResults.matches.filter(m => m.metadata?.documentId === documentId);
         console.log(`[PDF Chat] Found ${relevantMatches.length} relevant matches (from top 10).`);
 
@@ -312,7 +304,6 @@ export default {
         }
 
         // 4. Generate Answer
-        // Improved System Prompt for better formatting and natural conversation
         const prompt = `You are an intelligent research assistant helping a user analyze a PDF document.
 
 Document Context:
@@ -333,7 +324,7 @@ Answer:`;
 
         const response = await env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
           messages: [{ role: "user", content: prompt }],
-          max_tokens: 800 // Increased for longer summaries
+          max_tokens: 800 
         });
 
         const answer = (response as any).response;
