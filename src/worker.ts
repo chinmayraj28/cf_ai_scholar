@@ -128,10 +128,15 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
     const sections = (plan as any).sections || [];
     console.log(`[Step 1] Generated ${sections.length} sections.`);
 
-    // Step 2: Research & Write Each Section
-    const sectionResults = await Promise.all(
-      sections.map((section: Section) =>
-        step.do(`research-section-${section.title}`, async () => {
+    // Step 2: Research & Write Each Section SEQUENTIALLY
+    // We use a loop instead of Promise.all to avoid Cloudflare's "Too many subrequests" limit per step.
+    const sectionResults = [];
+    
+    for (const section of sections) {
+      // Generate a safe step name (remove special chars)
+      const stepName = `research-${section.title.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30)}`;
+      
+      const result = await step.do(stepName, async () => {
           console.log(`[Step 2] Processing section: ${section.title}`);
 
           // 2a. Generate Search Queries
@@ -189,7 +194,8 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
 
           // 2c. Write Section
           const context = sources.map(s => `Title: ${s.title}\nSummary: ${s.extract}`).join("\n\n");
-          if (!context) return { title: section.title, content: "No sources found.", sources: [] };
+          
+          if (!context) return { title: section.title, content: "No sources found for this section.", sources: [] };
 
           const writeResponse = await this.env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
             messages: [{ role: "user", content: writerPrompt(section.title, context) }],
@@ -200,9 +206,10 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
             content: (writeResponse as any).response,
             sources: sources.map(s => ({ title: s.title, url: s.url }))
           };
-        })
-      )
-    );
+      });
+      
+      sectionResults.push(result);
+    }
 
     // Step 3: Compile Report
     await step.do("compile-report", async () => {
@@ -213,7 +220,7 @@ export class ResearchWorkflow extends WorkflowEntrypoint<Env, { query: string; s
       
       for (const section of sectionResults) {
         fullContent += section.content + "\n\n";
-        allSources.push(...section.sources);
+        allSources.push(...(section.sources || []));
       }
 
       // Deduplicate sources
