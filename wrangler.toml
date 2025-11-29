@@ -1,0 +1,24 @@
+name = "cf-ai-research-assistant"
+main = "src/worker.ts"
+compatibility_date = "2024-04-03"
+
+[[workflows]]
+name = "RESEARCH_WORKFLOW"
+binding = "RESEARCH_WORKFLOW"
+class_name = "ResearchWorkflow"
+
+[[kv_namespaces]]
+binding = "RESEARCH_CACHE"
+id = "01a8ccfe51174b3786cb191a7385597c"
+preview_id = "06504465bd724b318bfe93507ee42227"
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "pdf-index"
+
+# For Next.js static export (only used in production)
+# [site]
+# bucket = "./.next/out"
